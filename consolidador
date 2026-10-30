@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""
+Consolidador de Planilhas de Vendas
+===================================
+
+Lê todas as planilhas (.xlsx, .xlsm e .csv) de uma pasta, mesmo com formatos
+diferentes (nomes de colunas variados, datas e valores em formatos distintos),
+limpa os dados e gera um único relatório em Excel com:
+
+  - Resumo      : indicadores principais (calculados por fórmulas)
+  - Por Produto / Por Vendedor / Por Mês : totais com gráfico
+  - Dados       : todas as vendas consolidadas, com filtro
+  - Problemas   : linhas descartadas e o motivo (nada some em silêncio)
+
+Uso:
+    python consolidador.py
+    python consolidador.py --entrada minha_pasta --saida resultado.xlsx
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import re
+import sys
+import unicodedata
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+log = logging.getLogger("consolidador")
+
+# --------------------------------------------------------------------------
+# Configuração
+# --------------------------------------------------------------------------
+COLUNAS_PADRAO = ["data", "produto", "vendedor", "quantidade", "preco"]
+
+# Nomes alternativos aceitos para cada coluna (já sem acento e em minúsculas).
+# Para suportar uma planilha nova, basta acrescentar o nome aqui.
+APELIDOS = {
+    "data": {"data", "dt", "data venda", "data da venda", "date"},
+    "produto": {"produto", "item", "descricao", "product"},
+    "vendedor": {"vendedor", "vendedora", "responsavel", "seller"},
+    "quantidade": {"quantidade", "qtd", "qtde", "quantity"},
+    "preco": {"preco", "preco unitario", "valor unitario", "valor", "price"},
+}
+
+FORMATOS_DATA = ("%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d.%m.%Y")
+
+FONTE = "Arial"
+COR_CABECALHO = "1F3864"
+MOEDA = '"R$" #,##0.00'
+
+
+# --------------------------------------------------------------------------
+# Conversão e limpeza de valores
+# --------------------------------------------------------------------------
+def normalizar_texto(texto: object) -> str:
+    """'Preço Unitário ' -> 'preco unitario' (para comparar nomes de colunas)."""
+    sem_acento = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode()
+    return re.sub(r"[\s_]+", " ", sem_acento).strip().lower()
+
+
+def converter_numero(valor: object) -> float:
+    """Aceita 1234.5, '1.234,50', 'R$ 89,90' etc. Retorna NaN se não der."""
+    if pd.isna(valor):
+        return float("nan")
+    if pd.api.types.is_number(valor):
+        return float(valor)
+    texto = re.sub(r"[^\d,.\-]", "", str(valor))
+    if not texto:
+        return float("nan")
+    if "," in texto:  # formato brasileiro: ponto separa milhar, vírgula os decimais
+        texto = texto.replace(".", "").replace(",", ".")
+    try:
+        return float(texto)
+    except ValueError:
+        return float("nan")
+
+
+def converter_data(valor: object) -> pd.Timestamp:
+    """Aceita datas do Excel, '2026-03-15', '15/03/2026', '15/03/26'..."""
+    if pd.isna(valor):
+        return pd.NaT
+    if isinstance(valor, datetime):  # inclui pd.Timestamp
+        return pd.Timestamp(valor)
+    texto = str(valor).strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}", texto):
+        return pd.to_datetime(texto[:10], format="%Y-%m-%d", errors="coerce")
+    for formato in FORMATOS_DATA:
+        try:
+            return pd.Timestamp(datetime.strptime(texto, formato))
+        except ValueError:
+            continue
+    return pd.NaT
+
+
+def padronizar_texto(valor: object):
+    """'  nOtebook ' -> 'Notebook'. Vazio vira NA."""
+    if pd.isna(valor):
+        return pd.NA
+    texto = re.sub(r"\s+", " ", str(valor)).strip()
+    return texto.title() if texto else pd.NA
+
+
+# --------------------------------------------------------------------------
+# Leitura
+# --------------------------------------------------------------------------
+def listar_arquivos(pasta: Path) -> list[Path]:
+    extensoes = {".xlsx", ".xlsm", ".csv"}
+    return sorted(
+        p for p in pasta.iterdir()
+        if p.suffix.lower() in extensoes and not p.name.startswith("~$")
+    )
+
+
+def ler_csv(caminho: Path) -> pd.DataFrame:
+    """Descobre sozinho o separador (; , ou tab) e o encoding do CSV."""
+    for encoding in ("utf-8-sig", "latin-1"):
+        try:
+            with open(caminho, encoding=encoding) as f:
+                cabecalho = f.readline()
+            separador = max((";", ",", "\t"), key=cabecalho.count)
+            return pd.read_csv(caminho, sep=separador, encoding=encoding, dtype=object)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("encoding do CSV não reconhecido")
+
+
+def mapear_colunas(df: pd.DataFrame) -> pd.DataFrame:
+    """Renomeia as colunas para o padrão interno. Erro se faltar alguma."""
+    renomear: dict[str, str] = {}
+    for coluna in df.columns:
+        chave = normalizar_texto(coluna)
+        for padrao, apelidos in APELIDOS.items():
+            if chave in apelidos and padrao not in renomear.values():
+                renomear[coluna] = padrao
+    faltando = [c for c in COLUNAS_PADRAO if c not in renomear.values()]
+    if faltando:
+        raise ValueError("colunas não encontradas: " + ", ".join(faltando))
+    return df.rename(columns=renomear)[COLUNAS_PADRAO].copy()
+
+
+def ler_arquivo(caminho: Path) -> tuple[list[pd.DataFrame], list[dict]]:
+    """Lê um arquivo (todas as abas, se for Excel). Devolve (tabelas, avisos)."""
+    tabelas, avisos = [], []
+    try:
+        if caminho.suffix.lower() == ".csv":
+            abas = {None: ler_csv(caminho)}
+        else:
+            abas = pd.read_excel(caminho, sheet_name=None, dtype=object)
+    except Exception as erro:  # arquivo corrompido, protegido por senha etc.
+        log.warning("  ! %s ignorado: %s", caminho.name, erro)
+        return [], [{"arquivo": caminho.name, "linha": "-", "motivo": f"Arquivo ilegível: {erro}"}]
+
+    for aba, df in abas.items():
+        origem = caminho.name if len(abas) == 1 else f"{caminho.name} [{aba}]"
+        try:
+            df = mapear_colunas(df)
+        except ValueError as erro:
+            log.warning("  ! %s ignorada: %s", origem, erro)
+            avisos.append({"arquivo": origem, "linha": "-", "motivo": f"Aba ignorada: {erro}"})
+            continue
+        df["linha_origem"] = df.index + 2  # +2: cabeçalho é a linha 1
+        df["arquivo"] = origem
+        tabelas.append(df)
+    return tabelas, avisos
+
+
+# --------------------------------------------------------------------------
+# Limpeza e validação
+# --------------------------------------------------------------------------
+def validar_linha(linha: dict) -> str:
+    """Devolve o motivo da rejeição, ou '' se a linha estiver ok."""
+    faltando = [c for c in COLUNAS_PADRAO if pd.isna(linha[c])]
+    if faltando:
+        return "Campo ausente ou inválido: " + ", ".join(faltando)
+    if linha["quantidade"] <= 0:
+        return "Quantidade deve ser maior que zero"
+    if linha["preco"] < 0:
+        return "Preço negativo"
+    return ""
+
+
+def limpar(bruto: pd.DataFrame, manter_duplicados: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Devolve (vendas_validas, problemas)."""
+    df = bruto.dropna(how="all", subset=COLUNAS_PADRAO).copy()  # some linhas totalmente vazias
+
+    df["data"] = pd.to_datetime(df["data"].map(converter_data))
+    df["quantidade"] = df["quantidade"].map(converter_numero)
+    df["preco"] = df["preco"].map(converter_numero)
+    for coluna in ("produto", "vendedor"):
+        df[coluna] = df[coluna].map(padronizar_texto)
+
+    df["motivo"] = [validar_linha(linha) for linha in df.to_dict("records")]
+    colunas_problema = ["arquivo", "linha_origem", "motivo"]
+    problemas = [df.loc[df["motivo"] != "", colunas_problema]]
+    validos = df[df["motivo"] == ""].copy()
+
+    if not manter_duplicados:
+        duplicado = validos.duplicated(subset=COLUNAS_PADRAO, keep="first")
+        extras = validos[duplicado].assign(motivo="Registro duplicado (ignorado)")
+        problemas.append(extras[colunas_problema])
+        validos = validos[~duplicado]
+
+    validos = validos.sort_values(["data", "arquivo", "linha_origem"]).reset_index(drop=True)
+    validos["mes"] = validos["data"].dt.to_period("M").dt.to_timestamp()
+
+    problemas = pd.concat(problemas, ignore_index=True).rename(columns={"linha_origem": "linha"})
+    return validos, problemas
+
+
+# --------------------------------------------------------------------------
+# Relatório em Excel
+# --------------------------------------------------------------------------
+def _acabamento(ws, cabecalho: bool = True) -> None:
+    """Fonte Arial, cabeçalho colorido e largura de colunas automática."""
+    for linha in ws.iter_rows():
+        for cel in linha:
+            if cabecalho and cel.row == 1:
+                cel.font = Font(name=FONTE, bold=True, color="FFFFFF")
+                cel.fill = PatternFill("solid", fgColor=COR_CABECALHO)
+                cel.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                cel.font = Font(name=FONTE)
+    for coluna in ws.columns:
+        tamanhos = [
+            len(str(c.value)) for c in coluna
+            if c.value is not None and not str(c.value).startswith("=")
+        ]
+        largura = min(max(max(tamanhos, default=12) + 2, 14), 45)
+        ws.column_dimensions[get_column_letter(coluna[0].column)].width = largura
+
+
+def _numero(valor: float):
+    return int(valor) if float(valor).is_integer() else float(valor)
+
+
+def _aba_dados(wb: Workbook, validos: pd.DataFrame) -> None:
+    ws = wb.create_sheet("Dados")
+    ws.append(["Data", "Produto", "Vendedor", "Quantidade", "Preço unitário",
+               "Total", "Mês", "Arquivo de origem"])
+    for i, v in enumerate(validos.itertuples(index=False), start=2):
+        ws.append([
+            v.data.to_pydatetime(), v.produto, v.vendedor, _numero(v.quantidade),
+            float(v.preco), f"=D{i}*E{i}", v.mes.to_pydatetime(), v.arquivo,
+        ])
+    for letra, formato in {"A": "dd/mm/yyyy", "E": MOEDA, "F": MOEDA, "G": "mm/yyyy"}.items():
+        for cel in ws[letra][1:]:
+            cel.number_format = formato
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    _acabamento(ws)
+
+
+def _aba_problemas(wb: Workbook, problemas: pd.DataFrame) -> None:
+    ws = wb.create_sheet("Problemas")
+    ws.append(["Arquivo", "Linha", "Motivo"])
+    for p in problemas.itertuples(index=False):
+        ws.append([p.arquivo, p.linha, p.motivo])
+    ws.freeze_panes = "A2"
+    _acabamento(ws)
+
+
+def _aba_agrupada(wb: Workbook, titulo: str, rotulo: str, validos: pd.DataFrame,
+                  coluna: str, letra_dados: str, fim: int) -> None:
+    """Tabela de totais por categoria (fórmulas SUMIFS sobre a aba Dados) + gráfico."""
+    if coluna == "mes":
+        categorias = [pd.Timestamp(m).to_pydatetime() for m in sorted(validos["mes"].unique())]
+    else:
+        totais = (validos["quantidade"] * validos["preco"]).groupby(validos[coluna]).sum()
+        categorias = list(totais.sort_values(ascending=False).index)
+
+    def faixa(letra: str) -> str:
+        return f"Dados!${letra}$2:${letra}${fim}"
+
+    ws = wb.create_sheet(titulo)
+    ws.append([rotulo, "Total vendido", "Itens vendidos", "% do total"])
+    ultimo = len(categorias) + 1
+    for i, categoria in enumerate(categorias, start=2):
+        ws.cell(i, 1, categoria)
+        ws.cell(i, 2, f"=SUMIFS({faixa('F')},{faixa(letra_dados)},A{i})")
+        ws.cell(i, 3, f"=SUMIFS({faixa('D')},{faixa(letra_dados)},A{i})")
+        ws.cell(i, 4, f"=IFERROR(B{i}/SUM($B$2:$B${ultimo}),0)")
+    total = ultimo + 1
+    ws.cell(total, 1, "Total")
+    for col in "BCD":
+        ws[f"{col}{total}"] = f"=SUM({col}2:{col}{ultimo})"
+
+    for i in range(2, total + 1):
+        ws.cell(i, 2).number_format = MOEDA
+        ws.cell(i, 3).number_format = "#,##0"
+        ws.cell(i, 4).number_format = "0.0%"
+        if coluna == "mes" and i <= ultimo:
+            ws.cell(i, 1).number_format = "mm/yyyy"
+            ws.cell(i, 1).alignment = Alignment(horizontal="left")
+    _acabamento(ws)
+    for col in range(1, 5):
+        ws.cell(total, col).font = Font(name=FONTE, bold=True)
+
+    grafico = BarChart()
+    grafico.type = "col"
+    grafico.title = f"Total vendido por {rotulo.lower()}"
+    grafico.legend = None
+    grafico.add_data(Reference(ws, min_col=2, min_row=1, max_row=ultimo), titles_from_data=True)
+    grafico.set_categories(Reference(ws, min_col=1, min_row=2, max_row=ultimo))
+    grafico.x_axis.delete = False
+    grafico.y_axis.delete = False
+    if coluna == "mes":
+        grafico.x_axis.number_format = "mm/yyyy"
+    grafico.height, grafico.width = 8.5, 17
+    ws.add_chart(grafico, "F2")
+
+
+def _aba_resumo(ws, fim: int, fim_problemas: int, n_arquivos: int) -> None:
+    ws["A1"] = "Relatório consolidado de vendas"
+    ws["A2"] = f"Gerado em {datetime.now():%d/%m/%Y %H:%M}"
+    indicadores = [
+        ("Faturamento total", f"=SUM(Dados!F2:F{fim})", MOEDA),
+        ("Itens vendidos", f"=SUM(Dados!D2:D{fim})", "#,##0"),
+        ("Número de vendas", f"=COUNTA(Dados!B2:B{fim})", "#,##0"),
+        ("Ticket médio", "=IFERROR(B4/B6,0)", MOEDA),
+        ("Primeira venda", f"=MIN(Dados!A2:A{fim})", "dd/mm/yyyy"),
+        ("Última venda", f"=MAX(Dados!A2:A{fim})", "dd/mm/yyyy"),
+        ("Arquivos processados", n_arquivos, "0"),
+        ("Registros descartados", f"=COUNTA(Problemas!A2:A{fim_problemas})", "0"),
+    ]
+    for i, (nome, valor, formato) in enumerate(indicadores, start=4):
+        ws.cell(i, 1, nome)
+        ws.cell(i, 2, valor).number_format = formato
+    ws["A13"] = ("Os indicadores são fórmulas calculadas a partir da aba Dados. "
+                 "Linhas descartadas estão listadas, com o motivo, na aba Problemas.")
+    _acabamento(ws, cabecalho=False)
+    ws["A1"].font = Font(name=FONTE, bold=True, size=16, color=COR_CABECALHO)
+    ws["A2"].font = Font(name=FONTE, italic=True, color="666666")
+    ws["A13"].font = Font(name=FONTE, italic=True, color="666666")
+    for i in range(4, 4 + len(indicadores)):
+        ws.cell(i, 1).font = Font(name=FONTE, bold=True)
+        ws.cell(i, 2).alignment = Alignment(horizontal="right")
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 20
+
+
+def gerar_relatorio(validos: pd.DataFrame, problemas: pd.DataFrame,
+                    n_arquivos: int, caminho: Path) -> None:
+    wb = Workbook()
+    resumo = wb.active
+    resumo.title = "Resumo"
+    fim = len(validos) + 1                      # última linha de dados na aba Dados
+    fim_problemas = max(len(problemas) + 1, 2)  # última linha na aba Problemas
+
+    _aba_agrupada(wb, "Por Produto", "Produto", validos, "produto", "B", fim)
+    _aba_agrupada(wb, "Por Vendedor", "Vendedor", validos, "vendedor", "C", fim)
+    _aba_agrupada(wb, "Por Mês", "Mês", validos, "mes", "G", fim)
+    _aba_dados(wb, validos)
+    _aba_problemas(wb, problemas)
+    _aba_resumo(resumo, fim, fim_problemas, n_arquivos)
+
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(caminho)
+
+
+# --------------------------------------------------------------------------
+# Linha de comando
+# --------------------------------------------------------------------------
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Consolida planilhas de vendas em um único relatório Excel.")
+    parser.add_argument("--entrada", type=Path, default=Path("dados_entrada"),
+                        help="pasta com as planilhas (padrão: dados_entrada)")
+    parser.add_argument("--saida", type=Path, default=Path("saida/relatorio_vendas.xlsx"),
+                        help="arquivo Excel de saída (padrão: saida/relatorio_vendas.xlsx)")
+    parser.add_argument("--manter-duplicados", action="store_true",
+                        help="não remove linhas idênticas")
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    if not args.entrada.is_dir():
+        log.error("Pasta de entrada não encontrada: %s", args.entrada)
+        return 1
+    arquivos = listar_arquivos(args.entrada)
+    if not arquivos:
+        log.error("Nenhuma planilha (.xlsx ou .csv) encontrada em %s", args.entrada)
+        return 1
+
+    log.info("Lendo %d arquivo(s) de %s", len(arquivos), args.entrada)
+    tabelas, avisos = [], []
+    for arquivo in arquivos:
+        novas, novos_avisos = ler_arquivo(arquivo)
+        tabelas += novas
+        avisos += novos_avisos
+        log.info("  - %s: %d linha(s)", arquivo.name, sum(len(t) for t in novas))
+    if not tabelas:
+        log.error("Nenhum arquivo com as colunas esperadas (%s).", ", ".join(COLUNAS_PADRAO))
+        return 1
+
+    validos, problemas = limpar(pd.concat(tabelas, ignore_index=True), args.manter_duplicados)
+    if avisos:
+        problemas = pd.concat([pd.DataFrame(avisos), problemas], ignore_index=True)
+    if validos.empty:
+        log.error("Nenhuma venda válida após a limpeza. Veja os motivos acima.")
+        return 1
+
+    try:
+        gerar_relatorio(validos, problemas, len(arquivos), args.saida)
+    except PermissionError:
+        log.error("Não foi possível salvar %s. Feche o arquivo no Excel e tente de novo.", args.saida)
+        return 1
+
+    log.info("Pronto! %d vendas válidas, %d registros descartados.", len(validos), len(problemas))
+    log.info("Relatório salvo em: %s", args.saida)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
